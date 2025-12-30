@@ -10,6 +10,9 @@ verilog:
 	mkdir -p $(BUILD_DIR)
 	mill -i  -j 8  $(PRJ).runMain dma.Main
 
+verdi:
+	verdi -sverilog -F ./output/filelist.f &
+	
 help:
 	mill -i $(PRJ).runMain dma.Main --help
 

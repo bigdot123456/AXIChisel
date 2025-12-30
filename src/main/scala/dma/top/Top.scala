@@ -89,7 +89,7 @@ object Main extends App {
                                  Array(
         s"--target-dir=${config.OutputDir}"
       ),
-    firtoolOpts = Array("-disable-all-randomization", "-strip-debug-info", "-default-layer-specialization=enable"))
+    firtoolOpts = Array("-disable-all-randomization",  "-default-layer-specialization=enable"))
         case _ => ()
     }
 } // object Main
