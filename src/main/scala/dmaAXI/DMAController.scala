@@ -62,7 +62,6 @@ class DMAController(
   })
 
   // -------------------- 1. Chisel 7.0枚举（用法不变，仍在chisel3.util） --------------------
-  // Chisel-style Enum (returns UInt states)
   val sIdle :: sReadBurstSetup :: sReadData :: sWriteBurstSetup :: sWriteData :: sDone :: Nil = Enum(6)
   val stateReg = RegInit(sIdle)
 
@@ -109,15 +108,15 @@ class DMAController(
 
   // -------------------- 4. FIFO实例化（使用 Queue） --------------------
   val dataFifo = Module(new Queue(UInt(256.W), fifoDepth))
+  // 关键修复1：为FIFO接口设置全局默认值，避免未初始化
+  dataFifo.io.enq.valid := false.B
+  dataFifo.io.enq.bits := 0.U(256.W)
+  dataFifo.io.deq.ready := false.B
   
-  // 兼容所有Chisel版本的FIFO计数方案（替代原非法的ram访问）
-  val fifoCount = RegInit(0.U(log2Ceil(fifoDepth + 1).W))
-  when(dataFifo.io.enq.fire) { fifoCount := fifoCount + 1.U }
-  .elsewhen(dataFifo.io.deq.fire) { fifoCount := fifoCount - 1.U }
-  io.fifo_level := fifoCount
-  
+  // Queue状态输出
+  io.fifo_level := dataFifo.io.count
   // 更新 regStatus bit1 (FIFO高水位)
-  val fifoHighBit = (fifoCount >= maxBurstLen.U).asUInt << 1
+  val fifoHighBit = (dataFifo.io.count >= maxBurstLen.U).asUInt << 1
   regStatus := (regStatus & ~(1.U << 1)) | fifoHighBit
 
   // -------------------- 5. 状态机变量 --------------------
@@ -133,7 +132,7 @@ class DMAController(
   io.axi.ar.arsize := 5.U   // 256bit=32字节
   io.axi.ar.arlen := 0.U
   io.axi.ar.arvalid := false.B
-  io.axi.r.rready := true.B
+  io.axi.r.rready := false.B // 关键修复2：AXI读数据ready默认置false
 
   // 写地址通道
   io.axi.aw.awaddr := 0.U
@@ -149,11 +148,6 @@ class DMAController(
   io.axi.w.wvalid := false.B
   io.axi.b.bready := true.B
 
-  // FIFO连接（SyncFIFO接口兼容）
-  dataFifo.io.enq.bits := io.axi.r.rdata
-  dataFifo.io.enq.valid := io.axi.r.rvalid
-  dataFifo.io.deq.ready := false.B
-
   // -------------------- 7. DMA状态机逻辑 --------------------
   switch(stateReg) {
     is(sIdle) {
@@ -162,8 +156,7 @@ class DMAController(
         remainingBytes := regLength
         currSrcAddr := regSrcAddr
         currDstAddr := regDstAddr
-        // 置位 busy bit (bit 0)
-        regStatus := regStatus | 1.U
+        regStatus := regStatus | 1.U // 置位忙标志
         stateReg := sReadBurstSetup
       }
     }
@@ -171,7 +164,7 @@ class DMAController(
     is(sReadBurstSetup) {
       when(remainingBytes > 0.U) {
         // 计算安全Burst长度
-        val safeBurstLen = DmaUtils.getSafeBurstLen(currSrcAddr, remainingBytes, burstBeatBytes)
+        val safeBurstLen = DmaUtils.getSafeBurstLen(currSrcAddr, remainingBytes)
         currBurstLen := Mux(safeBurstLen > maxBurstLen.U, maxBurstLen.U, safeBurstLen)
 
         // 发送读地址
@@ -182,6 +175,7 @@ class DMAController(
         when(io.axi.ar.arready) {
           io.axi.ar.arvalid := false.B
           stateReg := sReadData
+          io.axi.r.rready := true.B // 读数据阶段准备接收
         }
       } .otherwise {
         stateReg := sWriteBurstSetup
@@ -189,22 +183,27 @@ class DMAController(
     }
 
     is(sReadData) {
+      io.axi.r.rready := true.B // 持续准备接收读数据
+      // 关键修复3：仅在读数据有效且FIFO可入队时，驱动FIFO enq
       when(io.axi.r.rvalid && dataFifo.io.enq.ready) {
-        // 数据写入FIFO
+        dataFifo.io.enq.valid := true.B
+        dataFifo.io.enq.bits := io.axi.r.rdata
+        
         remainingBytes := remainingBytes - burstBeatBytes.U
         currSrcAddr := DmaUtils.alignTo32Byte(currSrcAddr + burstBeatBytes.U)
 
         // Burst结束判断
         when(io.axi.r.rlast || remainingBytes <= burstBeatBytes.U) {
+          io.axi.r.rready := false.B // 关闭读ready
           stateReg := Mux(remainingBytes > 0.U, sReadBurstSetup, sWriteBurstSetup)
         }
       }
     }
 
     is(sWriteBurstSetup) {
-      when(fifoCount >= maxBurstLen.U) {
+      when(dataFifo.io.count >= maxBurstLen.U) {
         // FIFO高水位，启动写Burst
-        val safeBurstLen = DmaUtils.getSafeBurstLen(currDstAddr, remainingBytes, burstBeatBytes)
+        val safeBurstLen = DmaUtils.getSafeBurstLen(currDstAddr, remainingBytes)
         val writeBurstLen = Mux(safeBurstLen > maxBurstLen.U, maxBurstLen.U, safeBurstLen)
 
         // 发送写地址
@@ -221,6 +220,7 @@ class DMAController(
     }
 
     is(sWriteData) {
+      // 关键修复4：写数据阶段驱动FIFO deq.ready
       dataFifo.io.deq.ready := true.B
       when(dataFifo.io.deq.valid) {
         io.axi.w.wdata := dataFifo.io.deq.bits
@@ -232,7 +232,8 @@ class DMAController(
           currDstAddr := DmaUtils.alignTo32Byte(currDstAddr + burstBeatBytes.U)
 
           when(io.axi.w.wlast) {
-            stateReg := Mux(remainingBytes > 0.U || fifoCount > 0.U,
+            dataFifo.io.deq.ready := false.B // 关闭deq.ready
+            stateReg := Mux(remainingBytes > 0.U || dataFifo.io.count > 0.U,
               sWriteBurstSetup, sDone)
           }
         }
@@ -240,7 +241,7 @@ class DMAController(
     }
 
     is(sDone) {
-      // 设置完成位 (bit 1) and clear busy bit (bit 0)
+      // 设置完成位 (bit 1) 并清除忙位 (bit 0)
       regCtrl := regCtrl | (1.U << 1)
       regStatus := regStatus & ~(1.U)
       stateReg := sIdle
@@ -249,11 +250,14 @@ class DMAController(
 
   // -------------------- 8. 错误处理 --------------------
   when(io.axi.b.bresp =/= 0.U || (io.axi.r.rvalid && io.axi.r.rresp =/= 0.U)) {
-    // 设置错误位 (bit 2) and clear busy bit
+    // 设置错误位 (bit 2) 并清除忙位
     regCtrl := regCtrl | (1.U << 2)
     regStatus := regStatus & ~(1.U)
+    // 错误时重置FIFO接口
+    dataFifo.io.enq.valid := false.B
+    dataFifo.io.deq.ready := false.B
     stateReg := sIdle
-  }
+ }
 
   // -------------------- 9. 输出信号 --------------------
   io.dma_busy := regStatus(0)
