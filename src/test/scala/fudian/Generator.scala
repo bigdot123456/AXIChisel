@@ -1,7 +1,6 @@
 package fudian
 
 import chisel3.RawModule
-import chisel3.stage.{ChiselGeneratorAnnotation, ChiselStage}
 
 object Generator extends App {
 
@@ -32,10 +31,7 @@ object Generator extends App {
   }
 
   val (module, expWidth, precision, firrtlOpts) = ArgParser.parse(args)
-  (new ChiselStage).execute(
-      firrtlOpts,
-      Seq(
-        ChiselGeneratorAnnotation(getModuleGen(module, expWidth, precision))
-      )
-    )
+  val gen = getModuleGen(module, expWidth, precision)
+  val mod = gen().asInstanceOf[RawModule]
+  _root_.circt.stage.ChiselStage.emitSystemVerilogFile(mod)
 }

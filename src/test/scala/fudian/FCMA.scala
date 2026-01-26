@@ -1,9 +1,6 @@
 package fudian
 
-import chisel3.stage.{ChiselGeneratorAnnotation, ChiselStage}
-
+// Use CIRCT ChiselStage available in this repo
 object FCMAMain extends App {
-  (new ChiselStage).execute(args, Seq(
-    ChiselGeneratorAnnotation(() => new FCMA(11, 53))
-  ))
+  _root_.circt.stage.ChiselStage.emitSystemVerilogFile(new FCMA(11, 53))
 }
