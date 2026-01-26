@@ -109,10 +109,15 @@ class DMAController(
 
   // -------------------- 4. FIFO实例化（使用 Queue） --------------------
   val dataFifo = Module(new Queue(UInt(256.W), fifoDepth))
-  // Queue provides io.enq / io.deq; use .count if available, otherwise approximate
-  io.fifo_level := dataFifo.io.count
-  // 更新 regStatus bit1 (FIFO高水位) without assigning to a slice
-  val fifoHighBit = (dataFifo.io.count >= maxBurstLen.U).asUInt << 1
+  
+  // 兼容所有Chisel版本的FIFO计数方案（替代原非法的ram访问）
+  val fifoCount = RegInit(0.U(log2Ceil(fifoDepth + 1).W))
+  when(dataFifo.io.enq.fire) { fifoCount := fifoCount + 1.U }
+  .elsewhen(dataFifo.io.deq.fire) { fifoCount := fifoCount - 1.U }
+  io.fifo_level := fifoCount
+  
+  // 更新 regStatus bit1 (FIFO高水位)
+  val fifoHighBit = (fifoCount >= maxBurstLen.U).asUInt << 1
   regStatus := (regStatus & ~(1.U << 1)) | fifoHighBit
 
   // -------------------- 5. 状态机变量 --------------------
@@ -166,7 +171,7 @@ class DMAController(
     is(sReadBurstSetup) {
       when(remainingBytes > 0.U) {
         // 计算安全Burst长度
-        val safeBurstLen = DmaUtils.getSafeBurstLen(currSrcAddr, remainingBytes)
+        val safeBurstLen = DmaUtils.getSafeBurstLen(currSrcAddr, remainingBytes, burstBeatBytes)
         currBurstLen := Mux(safeBurstLen > maxBurstLen.U, maxBurstLen.U, safeBurstLen)
 
         // 发送读地址
@@ -197,9 +202,9 @@ class DMAController(
     }
 
     is(sWriteBurstSetup) {
-      when(dataFifo.io.count >= maxBurstLen.U) {
+      when(fifoCount >= maxBurstLen.U) {
         // FIFO高水位，启动写Burst
-        val safeBurstLen = DmaUtils.getSafeBurstLen(currDstAddr, remainingBytes)
+        val safeBurstLen = DmaUtils.getSafeBurstLen(currDstAddr, remainingBytes, burstBeatBytes)
         val writeBurstLen = Mux(safeBurstLen > maxBurstLen.U, maxBurstLen.U, safeBurstLen)
 
         // 发送写地址
@@ -227,7 +232,7 @@ class DMAController(
           currDstAddr := DmaUtils.alignTo32Byte(currDstAddr + burstBeatBytes.U)
 
           when(io.axi.w.wlast) {
-            stateReg := Mux(remainingBytes > 0.U || dataFifo.io.count > 0.U,
+            stateReg := Mux(remainingBytes > 0.U || fifoCount > 0.U,
               sWriteBurstSetup, sDone)
           }
         }
@@ -248,7 +253,7 @@ class DMAController(
     regCtrl := regCtrl | (1.U << 2)
     regStatus := regStatus & ~(1.U)
     stateReg := sIdle
- }
+  }
 
   // -------------------- 9. 输出信号 --------------------
   io.dma_busy := regStatus(0)
