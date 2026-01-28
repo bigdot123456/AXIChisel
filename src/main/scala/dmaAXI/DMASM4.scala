@@ -3,11 +3,11 @@ package dmaAXI
 import chisel3._
 import chisel3.util._
 
-// ==================== 1. SM4算法核心模块（128bit粒度，CTR模式） ====================
-class SM4CTR_128 extends Module {
+// ==================== 1. 4周期流水线SM4加密模块（修复索引越界） ====================
+class SM4Pipeline_4Cycle extends Module {
   val io = IO(new Bundle {
     // 控制信号
-    val en = Input(Bool())        // 加密使能（128bit数据有效时置位）
+    val en = Input(Bool())        // 加密使能（输入数据有效时置位）
     val reset_iv = Input(Bool())  // 重置IV为初始值
     
     // 配置接口
@@ -17,10 +17,11 @@ class SM4CTR_128 extends Module {
     // 数据接口（128bit粒度）
     val plaintext = Input(UInt(128.W))   // 输入明文（128bit）
     val ciphertext = Output(UInt(128.W)) // 输出密文（128bit）
-    val valid = Output(Bool())           // 加密完成有效
-    val iv_out = Output(Vec(4, UInt(32.W))) // 输出当前IV（供下一级使用）
+    val valid = Output(Bool())           // 加密完成有效（4周期后置位）
+    val iv_out = Output(Vec(4, UInt(32.W))) // 输出当前IV
   })
 
+  // -------------------- 1. SM4基础定义 --------------------
   // SM4 S盒（国标GB/T 32907-2016）
   val SBOX = VecInit(
     BigInt("d6", 16).U(8.W), BigInt("90", 16).U(8.W), BigInt("e9", 16).U(8.W), BigInt("fe", 16).U(8.W),
@@ -89,7 +90,7 @@ class SM4CTR_128 extends Module {
     BigInt("d7", 16).U(8.W), BigInt("cb", 16).U(8.W), BigInt("39", 16).U(8.W), BigInt("48", 16).U(8.W)
   )
 
-  // SM4常量（BigInt避免负数）
+  // SM4常量
   val FK = VecInit(
     BigInt("a3b1bac6", 16).U(32.W),
     BigInt("56aa3350", 16).U(32.W),
@@ -116,7 +117,7 @@ class SM4CTR_128 extends Module {
     BigInt("484f565d", 16).U(32.W), BigInt("646b7279", 16).U(32.W)
   )
 
-  // SM4核心函数
+  // -------------------- 2. SM4核心函数 --------------------
   def sboxSub(in: UInt): UInt = {
     val bytes = VecInit((0 to 3).map(i => in(8*(3-i)+7, 8*(3-i))))
     VecInit(bytes.map(b => SBOX(b))).asUInt
@@ -127,7 +128,7 @@ class SM4CTR_128 extends Module {
   def ttrans(in: UInt): UInt = ltrans(sboxSub(in))
   def keyExp(in: UInt, ck: UInt): UInt = in ^ ttrans(in ^ rotl(in, 13) ^ rotl(in, 23) ^ ck)
 
-  // 密钥扩展
+  // -------------------- 3. 密钥扩展（预计算） --------------------
   val rk = VecInit(Seq.fill(32)(0.U(32.W)))
   val mk = VecInit((0 to 3).map(i => io.key(i) ^ FK(i)))
   
@@ -140,7 +141,7 @@ class SM4CTR_128 extends Module {
     rk(i) := keyExp(rk(i-1) ^ rk(i-2) ^ rk(i-3) ^ CK(i % CK.length), CK(i % CK.length))
   }
 
-  // CTR模式核心（128bit）
+  // -------------------- 4. CTR模式IV管理 --------------------
   val iv_reg = RegInit(VecInit(Seq.fill(4)(0.U(32.W))))
   when(io.reset_iv) {
     iv_reg := io.init_iv
@@ -153,41 +154,111 @@ class SM4CTR_128 extends Module {
     iv_reg(2) := iv_inc(95, 64)
     iv_reg(3) := iv_inc(127, 96)
   }
+  io.iv_out := iv_reg
 
-  // SM4加密核心（128bit）
-  def sm4Encrypt_128(data: UInt, rk: Vec[UInt]): UInt = {
-    val x = VecInit(Seq.fill(36)(0.U(32.W)))
-    x(0) := data(31, 0)
-    x(1) := data(63, 32)
-    x(2) := data(95, 64)
-    x(3) := data(127, 96)
-    
-    for (i <- 0 until 32) {
-      x(i+4) := x(i) ^ ttrans(x(i+1) ^ x(i+2) ^ x(i+3) ^ rk(i))
-    }
-    
-    Cat(x(35), x(34), x(33), x(32))
+  // -------------------- 5. 4周期流水线加密核心（修复索引越界） --------------------
+  // 流水线寄存器：保存每级的4个32bit中间结果（x值）
+  val pipe_x = VecInit(Seq.fill(4)(RegInit(VecInit(Seq.fill(4)(0.U(32.W))))))
+  // 流水线有效信号：跟踪每级是否有有效数据
+  val pipe_valid = VecInit(Seq.fill(5)(RegInit(false.B))) // 输入+4级流水线
+
+  // 步骤1：输入阶段（周期1）- 初始化x0-x3
+  when(io.en) {
+    pipe_x(0)(0) := io.plaintext(31, 0)    // x0
+    pipe_x(0)(1) := io.plaintext(63, 32)   // x1
+    pipe_x(0)(2) := io.plaintext(95, 64)   // x2
+    pipe_x(0)(3) := io.plaintext(127, 96)  // x3
+    pipe_valid(0) := true.B
+  }.otherwise {
+    pipe_valid(0) := false.B
   }
 
-  // 加密计算
-  val mask = sm4Encrypt_128(Cat(iv_reg(3), iv_reg(2), iv_reg(1), iv_reg(0)), rk)
+  // 步骤2：4级流水线计算（每级8轮）
+  // 第1级：0-7轮（周期1）
+  val x_stage1 = VecInit(Seq.fill(12)(0.U(32.W))) // x0-x11
+  x_stage1(0) := pipe_x(0)(0)
+  x_stage1(1) := pipe_x(0)(1)
+  x_stage1(2) := pipe_x(0)(2)
+  x_stage1(3) := pipe_x(0)(3)
+  for (i <- 0 until 8) {
+    x_stage1(i+4) := x_stage1(i) ^ ttrans(x_stage1(i+1) ^ x_stage1(i+2) ^ x_stage1(i+3) ^ rk(i))
+  }
+  // 保存到第2级寄存器（x8-x11）
+  pipe_x(1)(0) := x_stage1(8)
+  pipe_x(1)(1) := x_stage1(9)
+  pipe_x(1)(2) := x_stage1(10)
+  pipe_x(1)(3) := x_stage1(11)
+  pipe_valid(1) := pipe_valid(0)
+
+  // 第2级：8-15轮（周期2）
+  val x_stage2 = VecInit(Seq.fill(12)(0.U(32.W))) // x8-x19
+  x_stage2(0) := pipe_x(1)(0)
+  x_stage2(1) := pipe_x(1)(1)
+  x_stage2(2) := pipe_x(1)(2)
+  x_stage2(3) := pipe_x(1)(3)
+  for (i <- 8 until 16) {
+    val idx = i - 8 // 0-7
+    x_stage2(idx+4) := x_stage2(idx) ^ ttrans(x_stage2(idx+1) ^ x_stage2(idx+2) ^ x_stage2(idx+3) ^ rk(i))
+  }
+  // 保存到第3级寄存器（x16-x19）
+  pipe_x(2)(0) := x_stage2(8)
+  pipe_x(2)(1) := x_stage2(9)
+  pipe_x(2)(2) := x_stage2(10)
+  pipe_x(2)(3) := x_stage2(11)
+  pipe_valid(2) := pipe_valid(1)
+
+  // 第3级：16-23轮（周期3）
+  val x_stage3 = VecInit(Seq.fill(12)(0.U(32.W))) // x16-x27
+  x_stage3(0) := pipe_x(2)(0)
+  x_stage3(1) := pipe_x(2)(1)
+  x_stage3(2) := pipe_x(2)(2)
+  x_stage3(3) := pipe_x(2)(3)
+  for (i <- 16 until 24) {
+    val idx = i - 16 // 0-7
+    x_stage3(idx+4) := x_stage3(idx) ^ ttrans(x_stage3(idx+1) ^ x_stage3(idx+2) ^ x_stage3(idx+3) ^ rk(i))
+  }
+  // 保存到第4级寄存器（x24-x27）
+  pipe_x(3)(0) := x_stage3(8)
+  pipe_x(3)(1) := x_stage3(9)
+  pipe_x(3)(2) := x_stage3(10)
+  pipe_x(3)(3) := x_stage3(11)
+  pipe_valid(3) := pipe_valid(2)
+
+  // 第4级：24-31轮（周期4）
+  val x_stage4 = VecInit(Seq.fill(12)(0.U(32.W))) // x24-x35
+  x_stage4(0) := pipe_x(3)(0)
+  x_stage4(1) := pipe_x(3)(1)
+  x_stage4(2) := pipe_x(3)(2)
+  x_stage4(3) := pipe_x(3)(3)
+  for (i <- 24 until 32) {
+    val idx = i - 24 // 0-7
+    x_stage4(idx+4) := x_stage4(idx) ^ ttrans(x_stage4(idx+1) ^ x_stage4(idx+2) ^ x_stage4(idx+3) ^ rk(i))
+  }
+  pipe_valid(4) := pipe_valid(3)
+
+  // 步骤3：生成加密掩码（修复核心错误）
+  // 32轮完成后，x32-x35是最终结果，逆序拼接为128bit掩码
+  val mask = Cat(x_stage4(11), x_stage4(10), x_stage4(9), x_stage4(8)) // x35, x34, x33, x32
+
+  // 步骤4：输出处理（CTR模式）
   val ciphertext_reg = RegInit(0.U(128.W))
   val valid_reg = RegInit(false.B)
 
-  when(io.en) {
+  // 4周期后输出有效
+  when(pipe_valid(4)) {
+    // CTR模式：明文 ^ 掩码
     ciphertext_reg := io.plaintext ^ mask
     valid_reg := true.B
   }.otherwise {
     valid_reg := false.B
   }
 
-  // 输出
+  // 最终输出
   io.ciphertext := ciphertext_reg
   io.valid := valid_reg
-  io.iv_out := iv_reg
 }
 
-// ==================== 2. 重命名工具类（避免重复） ====================
+// ==================== 2. 寄存器定义工具类 ====================
 object DmaSM4PipelineRegs {
   // 基础寄存器
   val SRC_ADDR   = 0x00
@@ -222,6 +293,7 @@ object DmaSM4PipelineRegs {
   val SM4_IV3_SEL  = (SM4_IV3).U(32.W)(5, 2)
 }
 
+// ==================== 3. 工具类 ====================
 object DmaSM4PipelineUtils {
   // 安全burst长度计算
   def getSafeBurstLen(startAddr: UInt, remaining: UInt, beatBytes: Int = 32): UInt = {
@@ -243,7 +315,6 @@ object DmaSM4PipelineUtils {
     val padLen = 16.U - validBytes
     val padValue = Fill(8, padLen)(7, 0) // 补位值=补位长度
     
-    // 修复MuxLookup语法：映射关系用括号包裹
     val paddedData = MuxLookup(validBytes, 0.U(128.W))(Seq(
       1.U  -> Cat(Fill(15, padValue), data(7, 0)),
       2.U  -> Cat(Fill(14, padValue), data(15, 0)),
@@ -265,22 +336,9 @@ object DmaSM4PipelineUtils {
     paddedData
   }
 }
-/*
-// ==================== 3. APB4接口 ====================
-class APB4IO extends Bundle {
-  val PADDR   = Input(UInt(32.W))
-  val PPROT   = Input(UInt(3.W))
-  val PSEL    = Input(Bool())
-  val PENABLE = Input(Bool())
-  val PWRITE  = Input(Bool())
-  val PWDATA  = Input(UInt(32.W))
-  val PSTRB   = Input(UInt(4.W))
-  val PRDATA  = Output(UInt(32.W))
-  val PREADY  = Output(Bool())
-  val PSLVERR = Output(Bool())
-}
-*/
-// ==================== 4. 流水线DMA+SM4控制器（核心） ====================
+
+
+// ==================== 6. 流水线DMA+SM4控制器 ====================
 class DMAControllerWithSM4Pipeline(
   readFifoDepth: Int = 32,    // 读FIFO深度（128bit）
   encryptFifoDepth: Int = 32, // 加密FIFO深度（128bit）
@@ -348,7 +406,7 @@ class DMAControllerWithSM4Pipeline(
       is(DmaSM4PipelineRegs.DST_ADDR_SEL)  { regDstAddr := io.apb.PWDATA }
       is(DmaSM4PipelineRegs.LENGTH_SEL)    { regTotalLen := io.apb.PWDATA }
       is(DmaSM4PipelineRegs.CTRL_SEL)      {
-        val clearMask = ~((1.U << 1) | (1.U << 2))
+        val clearMask = ~((1.U << 1) | (1.U << 2)).asUInt
         regCtrl := io.apb.PWDATA & clearMask
       }
       is(DmaSM4PipelineRegs.SM4_KEY0_SEL)  { regSM4Key(0) := io.apb.PWDATA }
@@ -445,7 +503,7 @@ class DMAControllerWithSM4Pipeline(
             lastBlockValidBytes := 16.U
           }
         }.otherwise {
-          // 最后一块不足16字节 - 修复MuxLookup语法
+          // 最后一块不足16字节
           lastBlockValidBytes := bytesToRead(3, 0)
           val partialData = MuxLookup(bytesToRead, 0.U(128.W))(Seq(
             1.U  -> Cat(0.U(120.W), data_32b(7, 0)),
@@ -488,7 +546,8 @@ class DMAControllerWithSM4Pipeline(
   }
 
   // -------------------- 5. 二级流水线：SM4加密（128bit触发） --------------------
-  val sm4 = Module(new SM4CTR_128())
+  // 替换为4周期流水线SM4模块
+  val sm4 = Module(new SM4Pipeline_4Cycle())
   // SM4初始化
   sm4.io.en := false.B
   sm4.io.reset_iv := (globalState === sIdle)
@@ -533,8 +592,7 @@ class DMAControllerWithSM4Pipeline(
 
   io.axi.aw.awaddr  := 0.U
   io.axi.aw.awburst := 1.U
-  // 修复：AXI写地址通道字段是awsize，不是arsize
-  io.axi.aw.awsize  := 5.U
+  io.axi.aw.awsize  := 5.U // 修复：写地址通道是awsize，不是arsize
   io.axi.aw.awlen   := 0.U
   io.axi.aw.awvalid := false.B
   
@@ -682,13 +740,11 @@ object DMAGenWithSM4Pipeline extends App {
     ),
     Array(
       "--target-dir=output_dma_sm4_pipeline"
-    ),
-        firtoolOpts = Array("-disable-all-randomization",  "-default-layer-specialization=enable")     
-
+    )
   )
 }
 
-// 兼容原有生成器名称（避免修改运行命令）
+// 兼容原有生成器名称
 object DMAGenWithSM4 extends App {
   DMAGenWithSM4Pipeline.main(args)
 }
