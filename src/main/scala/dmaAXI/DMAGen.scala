@@ -11,3 +11,4 @@ object DMAGen extends App {
     firtoolOpts = Array("-disable-all-randomization",  "-default-layer-specialization=enable")     
   )
 }
+
