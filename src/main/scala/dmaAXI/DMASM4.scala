@@ -3,22 +3,23 @@ package dmaAXI
 import chisel3._
 import chisel3.util._
 
-// ==================== 1. 4周期流水线SM4加密模块（修复索引越界） ====================
+// ==================== 1. 4周期流水线SM4加解密模块（复用硬件） ====================
 class SM4Pipeline_4Cycle extends Module {
   val io = IO(new Bundle {
     // 控制信号
-    val en = Input(Bool())        // 加密使能（输入数据有效时置位）
-    val reset_iv = Input(Bool())  // 重置IV为初始值
+    val en = Input(Bool())        // 加密/解密使能
+    val reset_iv = Input(Bool())  // 重置IV
+    val mode = Input(Bool())      // 0=加密，1=解密
     
     // 配置接口
-    val key = Input(Vec(4, UInt(32.W)))  // 128bit SM4密钥
-    val init_iv = Input(Vec(4, UInt(32.W))) // 128bit初始IV
+    val key = Input(Vec(4, UInt(32.W)))  // 加解密密钥（共用）
+    val init_iv = Input(Vec(4, UInt(32.W))) // 初始IV
     
     // 数据接口（128bit粒度）
-    val plaintext = Input(UInt(128.W))   // 输入明文（128bit）
-    val ciphertext = Output(UInt(128.W)) // 输出密文（128bit）
-    val valid = Output(Bool())           // 加密完成有效（4周期后置位）
-    val iv_out = Output(Vec(4, UInt(32.W))) // 输出当前IV
+    val plaintext = Input(UInt(128.W))   // 明文（加密）/密文（解密）
+    val ciphertext = Output(UInt(128.W)) // 密文（加密）/明文（解密）
+    val valid = Output(Bool())           // 计算完成有效
+    val iv_out = Output(Vec(4, UInt(32.W))) // 当前IV
   })
 
   // -------------------- 1. SM4基础定义 --------------------
@@ -128,8 +129,8 @@ class SM4Pipeline_4Cycle extends Module {
   def ttrans(in: UInt): UInt = ltrans(sboxSub(in))
   def keyExp(in: UInt, ck: UInt): UInt = in ^ ttrans(in ^ rotl(in, 13) ^ rotl(in, 23) ^ ck)
 
-  // -------------------- 3. 密钥扩展（预计算） --------------------
-  val rk = VecInit(Seq.fill(32)(0.U(32.W)))
+  // -------------------- 3. 密钥扩展 --------------------
+  val rk = VecInit(Seq.fill(32)(0.U(32.W))) // 加密轮密钥RK[0-31]
   val mk = VecInit((0 to 3).map(i => io.key(i) ^ FK(i)))
   
   rk(0) := keyExp(mk(1) ^ mk(2) ^ mk(3) ^ CK(0), CK(0))
@@ -141,12 +142,17 @@ class SM4Pipeline_4Cycle extends Module {
     rk(i) := keyExp(rk(i-1) ^ rk(i-2) ^ rk(i-3) ^ CK(i % CK.length), CK(i % CK.length))
   }
 
-  // -------------------- 4. CTR模式IV管理 --------------------
+  // -------------------- 4. 加解密轮密钥选择 --------------------
+  val rk_sel = Wire(Vec(32, UInt(32.W)))
+  for (i <- 0 until 32) {
+    rk_sel(i) := Mux(io.mode, rk(31 - i), rk(i))
+  }
+
+  // -------------------- 5. CTR模式IV管理 --------------------
   val iv_reg = RegInit(VecInit(Seq.fill(4)(0.U(32.W))))
   when(io.reset_iv) {
     iv_reg := io.init_iv
   }.elsewhen(io.en) {
-    // IV自增（128bit）
     val iv_128 = Cat(iv_reg(3), iv_reg(2), iv_reg(1), iv_reg(0))
     val iv_inc = iv_128 + 1.U(128.W)
     iv_reg(0) := iv_inc(31, 0)
@@ -156,115 +162,106 @@ class SM4Pipeline_4Cycle extends Module {
   }
   io.iv_out := iv_reg
 
-  // -------------------- 5. 4周期流水线加密核心（修复索引越界） --------------------
-  // 流水线寄存器：保存每级的4个32bit中间结果（x值）
+  // -------------------- 6. 4周期流水线加解密核心 --------------------
   val pipe_x = VecInit(Seq.fill(4)(RegInit(VecInit(Seq.fill(4)(0.U(32.W))))))
-  // 流水线有效信号：跟踪每级是否有有效数据
-  val pipe_valid = VecInit(Seq.fill(5)(RegInit(false.B))) // 输入+4级流水线
+  val pipe_valid = VecInit(Seq.fill(5)(RegInit(false.B)))
 
-  // 步骤1：输入阶段（周期1）- 初始化x0-x3
+  // 输入阶段
   when(io.en) {
-    pipe_x(0)(0) := io.plaintext(31, 0)    // x0
-    pipe_x(0)(1) := io.plaintext(63, 32)   // x1
-    pipe_x(0)(2) := io.plaintext(95, 64)   // x2
-    pipe_x(0)(3) := io.plaintext(127, 96)  // x3
+    pipe_x(0)(0) := io.plaintext(31, 0)
+    pipe_x(0)(1) := io.plaintext(63, 32)
+    pipe_x(0)(2) := io.plaintext(95, 64)
+    pipe_x(0)(3) := io.plaintext(127, 96)
     pipe_valid(0) := true.B
   }.otherwise {
     pipe_valid(0) := false.B
   }
 
-  // 步骤2：4级流水线计算（每级8轮）
-  // 第1级：0-7轮（周期1）
-  val x_stage1 = VecInit(Seq.fill(12)(0.U(32.W))) // x0-x11
+  // 第1级：0-7轮
+  val x_stage1 = VecInit(Seq.fill(12)(0.U(32.W)))
   x_stage1(0) := pipe_x(0)(0)
   x_stage1(1) := pipe_x(0)(1)
   x_stage1(2) := pipe_x(0)(2)
   x_stage1(3) := pipe_x(0)(3)
   for (i <- 0 until 8) {
-    x_stage1(i+4) := x_stage1(i) ^ ttrans(x_stage1(i+1) ^ x_stage1(i+2) ^ x_stage1(i+3) ^ rk(i))
+    x_stage1(i+4) := x_stage1(i) ^ ttrans(x_stage1(i+1) ^ x_stage1(i+2) ^ x_stage1(i+3) ^ rk_sel(i))
   }
-  // 保存到第2级寄存器（x8-x11）
   pipe_x(1)(0) := x_stage1(8)
   pipe_x(1)(1) := x_stage1(9)
   pipe_x(1)(2) := x_stage1(10)
   pipe_x(1)(3) := x_stage1(11)
   pipe_valid(1) := pipe_valid(0)
 
-  // 第2级：8-15轮（周期2）
-  val x_stage2 = VecInit(Seq.fill(12)(0.U(32.W))) // x8-x19
+  // 第2级：8-15轮
+  val x_stage2 = VecInit(Seq.fill(12)(0.U(32.W)))
   x_stage2(0) := pipe_x(1)(0)
   x_stage2(1) := pipe_x(1)(1)
   x_stage2(2) := pipe_x(1)(2)
   x_stage2(3) := pipe_x(1)(3)
   for (i <- 8 until 16) {
-    val idx = i - 8 // 0-7
-    x_stage2(idx+4) := x_stage2(idx) ^ ttrans(x_stage2(idx+1) ^ x_stage2(idx+2) ^ x_stage2(idx+3) ^ rk(i))
+    val idx = i - 8
+    x_stage2(idx+4) := x_stage2(idx) ^ ttrans(x_stage2(idx+1) ^ x_stage2(idx+2) ^ x_stage2(idx+3) ^ rk_sel(i))
   }
-  // 保存到第3级寄存器（x16-x19）
   pipe_x(2)(0) := x_stage2(8)
   pipe_x(2)(1) := x_stage2(9)
   pipe_x(2)(2) := x_stage2(10)
   pipe_x(2)(3) := x_stage2(11)
   pipe_valid(2) := pipe_valid(1)
 
-  // 第3级：16-23轮（周期3）
-  val x_stage3 = VecInit(Seq.fill(12)(0.U(32.W))) // x16-x27
+  // 第3级：16-23轮
+  val x_stage3 = VecInit(Seq.fill(12)(0.U(32.W)))
   x_stage3(0) := pipe_x(2)(0)
   x_stage3(1) := pipe_x(2)(1)
   x_stage3(2) := pipe_x(2)(2)
   x_stage3(3) := pipe_x(2)(3)
   for (i <- 16 until 24) {
-    val idx = i - 16 // 0-7
-    x_stage3(idx+4) := x_stage3(idx) ^ ttrans(x_stage3(idx+1) ^ x_stage3(idx+2) ^ x_stage3(idx+3) ^ rk(i))
+    val idx = i - 16
+    x_stage3(idx+4) := x_stage3(idx) ^ ttrans(x_stage3(idx+1) ^ x_stage3(idx+2) ^ x_stage3(idx+3) ^ rk_sel(i))
   }
-  // 保存到第4级寄存器（x24-x27）
   pipe_x(3)(0) := x_stage3(8)
   pipe_x(3)(1) := x_stage3(9)
   pipe_x(3)(2) := x_stage3(10)
   pipe_x(3)(3) := x_stage3(11)
   pipe_valid(3) := pipe_valid(2)
 
-  // 第4级：24-31轮（周期4）
-  val x_stage4 = VecInit(Seq.fill(12)(0.U(32.W))) // x24-x35
+  // 第4级：24-31轮
+  val x_stage4 = VecInit(Seq.fill(12)(0.U(32.W)))
   x_stage4(0) := pipe_x(3)(0)
   x_stage4(1) := pipe_x(3)(1)
   x_stage4(2) := pipe_x(3)(2)
   x_stage4(3) := pipe_x(3)(3)
   for (i <- 24 until 32) {
-    val idx = i - 24 // 0-7
-    x_stage4(idx+4) := x_stage4(idx) ^ ttrans(x_stage4(idx+1) ^ x_stage4(idx+2) ^ x_stage4(idx+3) ^ rk(i))
+    val idx = i - 24
+    x_stage4(idx+4) := x_stage4(idx) ^ ttrans(x_stage4(idx+1) ^ x_stage4(idx+2) ^ x_stage4(idx+3) ^ rk_sel(i))
   }
   pipe_valid(4) := pipe_valid(3)
 
-  // 步骤3：生成加密掩码（修复核心错误）
-  // 32轮完成后，x32-x35是最终结果，逆序拼接为128bit掩码
-  val mask = Cat(x_stage4(11), x_stage4(10), x_stage4(9), x_stage4(8)) // x35, x34, x33, x32
+  // 生成掩码
+  val mask = Cat(x_stage4(11), x_stage4(10), x_stage4(9), x_stage4(8))
 
-  // 步骤4：输出处理（CTR模式）
+  // 输出处理
   val ciphertext_reg = RegInit(0.U(128.W))
   val valid_reg = RegInit(false.B)
 
-  // 4周期后输出有效
   when(pipe_valid(4)) {
-    // CTR模式：明文 ^ 掩码
     ciphertext_reg := io.plaintext ^ mask
     valid_reg := true.B
   }.otherwise {
     valid_reg := false.B
   }
 
-  // 最终输出
   io.ciphertext := ciphertext_reg
   io.valid := valid_reg
 }
 
-// ==================== 2. 寄存器定义工具类 ====================
+// ==================== 2. 寄存器定义 ====================
 object DmaSM4PipelineRegs {
   // 基础寄存器
   val SRC_ADDR   = 0x00
   val DST_ADDR   = 0x04
   val LENGTH     = 0x08
-  val CTRL       = 0x0C  // bit0=启动, bit1=完成, bit2=错误, bit3=加密使能, bit4=padding使能
+  // CTRL寄存器：bit0=启动, bit1=完成, bit2=错误, bit3=加解密使能, bit4=padding使能, bit5=加解密模式(0=加密,1=解密)
+  val CTRL       = 0x0C
   val STATUS     = 0x10
   
   // SM4配置寄存器
@@ -310,10 +307,10 @@ object DmaSM4PipelineUtils {
   // 32字节对齐
   def alignTo32Byte(addr: UInt): UInt = (addr >> 5) << 5
 
-  // PKCS#7 Padding补位（128bit）
+  // PKCS#7 Padding补位
   def pkcs7Padding(data: UInt, validBytes: UInt): UInt = {
     val padLen = 16.U - validBytes
-    val padValue = Fill(8, padLen)(7, 0) // 补位值=补位长度
+    val padValue = Fill(8, padLen)(7, 0)
     
     val paddedData = MuxLookup(validBytes, 0.U(128.W))(Seq(
       1.U  -> Cat(Fill(15, padValue), data(7, 0)),
@@ -331,36 +328,123 @@ object DmaSM4PipelineUtils {
       13.U -> Cat(Fill(3, padValue), data(103, 0)),
       14.U -> Cat(Fill(2, padValue), data(111, 0)),
       15.U -> Cat(Fill(1, padValue), data(119, 0)),
-      16.U -> data // 16字节无需补位
+      16.U -> data
     ))
     paddedData
   }
+
+  // PKCS#7 Padding去补位
+  def pkcs7Unpadding(data: UInt): (UInt, UInt) = {
+    val padLen = data(7, 0)
+    val padValid = padLen >= 1.U && padLen <= 16.U
+    val validData = MuxLookup(padLen, data)(Seq(
+      1.U  -> Cat(0.U(120.W), data(127, 120)),
+      2.U  -> Cat(0.U(112.W), data(127, 112)),
+      3.U  -> Cat(0.U(104.W), data(127, 104)),
+      4.U  -> Cat(0.U(96.W), data(127, 96)),
+      5.U  -> Cat(0.U(88.W), data(127, 88)),
+      6.U  -> Cat(0.U(80.W), data(127, 80)),
+      7.U  -> Cat(0.U(72.W), data(127, 72)),
+      8.U  -> Cat(0.U(64.W), data(127, 64)),
+      9.U  -> Cat(0.U(56.W), data(127, 56)),
+      10.U -> Cat(0.U(48.W), data(127, 48)),
+      11.U -> Cat(0.U(40.W), data(127, 40)),
+      12.U -> Cat(0.U(32.W), data(127, 32)),
+      13.U -> Cat(0.U(24.W), data(127, 24)),
+      14.U -> Cat(0.U(16.W), data(127, 16)),
+      15.U -> Cat(0.U(8.W), data(127, 8)),
+      16.U -> 0.U(128.W)
+    ))
+    val validBytes = 16.U - Mux(padValid, padLen, 0.U)
+    (validData, validBytes)
+  }
+}
+/*
+// ==================== 4. APB4接口 ====================
+class APB4IO extends Bundle {
+  val PADDR   = Input(UInt(32.W))
+  val PPROT   = Input(UInt(3.W))
+  val PSEL    = Input(Bool())
+  val PENABLE = Input(Bool())
+  val PWRITE  = Input(Bool())
+  val PWDATA  = Input(UInt(32.W))
+  val PSTRB   = Input(UInt(4.W))
+  val PRDATA  = Output(UInt(32.W))
+  val PREADY  = Output(Bool())
+  val PSLVERR = Output(Bool())
 }
 
-
-// ==================== 6. 流水线DMA+SM4控制器 ====================
+// ==================== 5. AXI4接口 ====================
+class AXI4Intf extends Bundle {
+  // 读地址通道
+  val ar = new Bundle {
+    val araddr  = Output(UInt(32.W))
+    val arburst = Output(UInt(2.W))
+    val arsize  = Output(UInt(3.W))
+    val arlen   = Output(UInt(8.W))
+    val arvalid = Output(Bool())
+    val arready = Input(Bool())
+  }
+  
+  // 读数据通道
+  val r = new Bundle {
+    val rdata  = Input(UInt(256.W))
+    val rresp  = Input(UInt(2.W))
+    val rlast  = Input(Bool())
+    val rvalid = Input(Bool())
+    val rready = Output(Bool())
+  }
+  
+  // 写地址通道
+  val aw = new Bundle {
+    val awaddr  = Output(UInt(32.W))
+    val awburst = Output(UInt(2.W))
+    val awsize  = Output(UInt(3.W))
+    val awlen   = Output(UInt(8.W))
+    val awvalid = Output(Bool())
+    val awready = Input(Bool())
+  }
+  
+  // 写数据通道
+  val w = new Bundle {
+    val wdata  = Output(UInt(256.W))
+    val wstrb  = Output(UInt(32.W))
+    val wlast  = Output(Bool())
+    val wvalid = Output(Bool())
+    val wready = Input(Bool())
+  }
+  
+  // 写响应通道
+  val b = new Bundle {
+    val bresp  = Input(UInt(2.W))
+    val bvalid = Input(Bool())
+    val bready = Output(Bool())
+  }
+}
+*/
+// ==================== 6. DMA+SM4加解密控制器 ====================
 class DMAControllerWithSM4Pipeline(
-  readFifoDepth: Int = 32,    // 读FIFO深度（128bit）
-  encryptFifoDepth: Int = 32, // 加密FIFO深度（128bit）
+  readFifoDepth: Int = 32,
+  cryptoFifoDepth: Int = 32,
   burstBeatBytes: Int = 32,
   maxBurstLen: Int = 15
 ) extends Module {
   val io = IO(new Bundle {
     val apb  = new APB4IO()
-    val axi  = new AXI4Intf()  // 复用已有AXI接口
+    val axi  = new AXI4Intf()
     val busy = Output(Bool())
     val level = Output(UInt(8.W))
   })
 
   // -------------------- 1. 全局状态与寄存器 --------------------
-  val sIdle :: sRunning :: sPadding :: sDone :: sError :: Nil = Enum(5)
+  val sIdle :: sRunning :: sPadding :: sUnpadding :: sDone :: sError :: Nil = Enum(6)
   val globalState = RegInit(sIdle)
 
   // 配置寄存器
   val regSrcAddr  = RegInit(0.U(32.W))
   val regDstAddr  = RegInit(0.U(32.W))
   val regTotalLen = RegInit(0.U(32.W))
-  val regCtrl     = RegInit(0.U(32.W))  // bit0=启动, bit1=完成, bit2=错误, bit3=加密使能, bit4=padding使能
+  val regCtrl     = RegInit(0.U(32.W))
   val regStatus   = RegInit(0.U(32.W))
   
   // SM4配置寄存器
@@ -370,7 +454,8 @@ class DMAControllerWithSM4Pipeline(
   // 传输状态
   val remainBytes = RegInit(0.U(32.W))
   val totalProcessed = RegInit(0.U(32.W))
-  val lastBlockValidBytes = RegInit(0.U(4.W)) // 最后一块有效字节数
+  val lastBlockValidBytes = RegInit(0.U(4.W))
+  val unpaddingValidBytes = RegInit(0.U(4.W))
 
   // -------------------- 2. APB接口 --------------------
   val apbSel = Wire(UInt(4.W))
@@ -420,22 +505,19 @@ class DMAControllerWithSM4Pipeline(
     }
   }
 
-  // -------------------- 3. 三级流水线FIFO --------------------
-  // 一级：AXI读 → 128bit读FIFO
+  // -------------------- 3. 流水线FIFO --------------------
   val readFifo = Module(new Queue(UInt(128.W), readFifoDepth, pipe = true, flow = true))
   readFifo.io.enq.valid := false.B
   readFifo.io.enq.bits  := 0.U
 
-  // 二级：SM4加密 → 128bit加密FIFO
-  val encryptFifo = Module(new Queue(UInt(128.W), encryptFifoDepth, pipe = true, flow = true))
-  encryptFifo.io.enq.valid := false.B
-  encryptFifo.io.enq.bits  := 0.U
-  encryptFifo.io.deq.ready := false.B
+  val cryptoFifo = Module(new Queue(UInt(128.W), cryptoFifoDepth, pipe = true, flow = true))
+  cryptoFifo.io.enq.valid := false.B
+  cryptoFifo.io.enq.bits  := 0.U
+  cryptoFifo.io.deq.ready := false.B
 
-  // 流水线水位
-  io.level := Cat(readFifo.io.count, encryptFifo.io.count)(7, 0)
+  io.level := Cat(readFifo.io.count, cryptoFifo.io.count)(7, 0)
 
-  // -------------------- 4. 一级流水线：AXI读（128bit粒度） --------------------
+  // -------------------- 4. AXI读 --------------------
   val sRIdle :: sRSetup :: sRData :: Nil = Enum(3)
   val readState = RegInit(sRIdle)
   
@@ -445,7 +527,7 @@ class DMAControllerWithSM4Pipeline(
   
   io.axi.ar.araddr  := 0.U
   io.axi.ar.arburst := 1.U
-  io.axi.ar.arsize  := 5.U // 32字节beat
+  io.axi.ar.arsize  := 5.U
   io.axi.ar.arlen   := 0.U
   io.axi.ar.arvalid := false.B
   io.axi.r.rready   := false.B
@@ -478,12 +560,10 @@ class DMAControllerWithSM4Pipeline(
       io.axi.r.rready := true.B
       
       when(io.axi.r.rvalid) {
-        // 32字节beat拆分为两个128bit数据
         val data_32b = io.axi.r.rdata
         val data1_128b = data_32b(127, 0)
         val data2_128b = data_32b(255, 128)
         
-        // 写入读FIFO（处理最后一块不完整数据）
         val bytesToRead = Mux(remainBytes >= 32.U, 32.U, remainBytes)
         when(bytesToRead >= 16.U) {
           readFifo.io.enq.valid := true.B
@@ -491,7 +571,6 @@ class DMAControllerWithSM4Pipeline(
           remainBytes := remainBytes - 16.U
           
           when(bytesToRead > 16.U) {
-            // 第二块128bit
             val readFifoEn2 = Wire(Bool())
             readFifoEn2 := readFifo.io.enq.fire && (bytesToRead > 16.U)
             when(readFifoEn2) {
@@ -499,11 +578,9 @@ class DMAControllerWithSM4Pipeline(
               remainBytes := remainBytes - 16.U
             }
           }.otherwise {
-            // 仅16字节，记录最后一块有效字节数
             lastBlockValidBytes := 16.U
           }
         }.otherwise {
-          // 最后一块不足16字节
           lastBlockValidBytes := bytesToRead(3, 0)
           val partialData = MuxLookup(bytesToRead, 0.U(128.W))(Seq(
             1.U  -> Cat(0.U(120.W), data_32b(7, 0)),
@@ -530,69 +607,69 @@ class DMAControllerWithSM4Pipeline(
         readBeatCnt := readBeatCnt + 1.U
         readAddr := DmaSM4PipelineUtils.alignTo32Byte(readAddr + burstBeatBytes.U)
 
-        // 结束burst
         val burstEnd = io.axi.r.rlast || (readBeatCnt === readBurst) || (remainBytes === 0.U)
         when(burstEnd) {
           io.axi.r.rready := false.B
           readState := Mux(globalState === sRunning && remainBytes > 0.U, sRSetup, sRIdle)
           
-          // 读完成，进入padding阶段
           when(remainBytes === 0.U) {
-            globalState := sPadding
+            globalState := Mux(regCtrl(5), sUnpadding, sPadding)
           }
         }
       }
     }
   }
 
-  // -------------------- 5. 二级流水线：SM4加密（128bit触发） --------------------
-  // 替换为4周期流水线SM4模块
+  // -------------------- 5. SM4加解密 --------------------
   val sm4 = Module(new SM4Pipeline_4Cycle())
-  // SM4初始化
   sm4.io.en := false.B
   sm4.io.reset_iv := (globalState === sIdle)
+  sm4.io.mode := regCtrl(5)
   sm4.io.key := regSM4Key
   sm4.io.init_iv := regSM4IV
   sm4.io.plaintext := 0.U(128.W)
 
-  // 加密触发：读FIFO有数据 + 加密FIFO未满 + 加密使能
-  val encryptTrigger = (readFifo.io.deq.valid && encryptFifo.io.count < (encryptFifoDepth - 1).U && regCtrl(3))
+  val cryptoTrigger = (readFifo.io.deq.valid && cryptoFifo.io.count < (cryptoFifoDepth - 1).U && regCtrl(3))
   val paddingTrigger = (globalState === sPadding && readFifo.io.deq.valid)
+  val unpaddingTrigger = (globalState === sUnpadding && readFifo.io.deq.valid)
 
-  when(encryptTrigger || paddingTrigger) {
+  when(cryptoTrigger || paddingTrigger || unpaddingTrigger) {
     readFifo.io.deq.ready := true.B
     
-    // 补位处理
     val plaintext = Mux(globalState === sPadding,
       DmaSM4PipelineUtils.pkcs7Padding(readFifo.io.deq.bits, lastBlockValidBytes),
       readFifo.io.deq.bits
     )
     
-    // SM4加密
     sm4.io.plaintext := plaintext
     sm4.io.en := true.B
     
-    // 加密完成后写入加密FIFO
     when(sm4.io.valid) {
-      encryptFifo.io.enq.valid := true.B
-      encryptFifo.io.enq.bits := sm4.io.ciphertext
+      cryptoFifo.io.enq.valid := true.B
+      
+      val (unpaddedData, validBytes) = DmaSM4PipelineUtils.pkcs7Unpadding(sm4.io.ciphertext)
+      cryptoFifo.io.enq.bits := Mux(globalState === sUnpadding, unpaddedData, sm4.io.ciphertext)
+      
+      when(globalState === sUnpadding) {
+        unpaddingValidBytes := validBytes
+      }
     }
   }.otherwise {
     readFifo.io.deq.ready := false.B
   }
 
-  // -------------------- 6. 三级流水线：AXI写（128bit粒度） --------------------
+  // -------------------- 6. AXI写 --------------------
   val sWIdle :: sWSetup :: sWData :: Nil = Enum(3)
   val writeState = RegInit(sWIdle)
   
   val writeAddr   = RegInit(0.U(32.W))
   val writeBurst  = RegInit(0.U(4.W))
   val writeBeatCnt = RegInit(0.U(4.W))
-  val writeDataReg = RegInit(0.U(256.W)) // 32字节beat缓存
+  val writeDataReg = RegInit(0.U(256.W))
 
   io.axi.aw.awaddr  := 0.U
   io.axi.aw.awburst := 1.U
-  io.axi.aw.awsize  := 5.U // 修复：写地址通道是awsize，不是arsize
+  io.axi.aw.awsize  := 5.U
   io.axi.aw.awlen   := 0.U
   io.axi.aw.awvalid := false.B
   
@@ -602,22 +679,22 @@ class DMAControllerWithSM4Pipeline(
   io.axi.w.wvalid := false.B
   io.axi.b.bready := true.B
 
-  // 收集两个128bit组成32字节beat
   val collect128bit = RegInit(false.B)
   val first128bit = RegInit(0.U(128.W))
+  val isLastBlock = RegInit(false.B)
 
   switch(writeState) {
     is(sWIdle) {
-      when(encryptFifo.io.deq.valid && (globalState === sRunning || globalState === sPadding)) {
+      when(cryptoFifo.io.deq.valid && (globalState === sRunning || globalState === sPadding || globalState === sUnpadding)) {
         writeAddr := Mux(writeAddr === 0.U, regDstAddr, writeAddr)
         writeState := sWSetup
         collect128bit := false.B
+        isLastBlock := (globalState === sPadding || globalState === sUnpadding)
       }
     }
 
     is(sWSetup) {
-      // 计算burst长度（基于加密FIFO数据量）
-      val fifoCount = encryptFifo.io.count
+      val fifoCount = cryptoFifo.io.count
       val burstLen = Mux(fifoCount >= 2.U, Mux(fifoCount > (maxBurstLen * 2).U, maxBurstLen.U, (fifoCount / 2.U)), 1.U)
       writeBurst := burstLen
       
@@ -633,35 +710,51 @@ class DMAControllerWithSM4Pipeline(
     }
 
     is(sWData) {
-      // 收集128bit数据组成32字节
-      when(encryptFifo.io.deq.valid && !collect128bit) {
-        first128bit := encryptFifo.io.deq.bits
-        encryptFifo.io.deq.ready := true.B
+      when(cryptoFifo.io.deq.valid && !collect128bit) {
+        first128bit := cryptoFifo.io.deq.bits
+        cryptoFifo.io.deq.ready := true.B
         collect128bit := true.B
-      }.elsewhen(encryptFifo.io.deq.valid && collect128bit) {
-        // 组成32字节beat
-        writeDataReg := Cat(encryptFifo.io.deq.bits, first128bit)
-        encryptFifo.io.deq.ready := true.B
+      }.elsewhen(cryptoFifo.io.deq.valid && collect128bit) {
+        writeDataReg := Cat(cryptoFifo.io.deq.bits, first128bit)
+        cryptoFifo.io.deq.ready := true.B
         collect128bit := false.B
         
-        // 写数据
         io.axi.w.wdata  := writeDataReg
         io.axi.w.wvalid := true.B
-        io.axi.w.wlast  := (writeBeatCnt === writeBurst - 1.U)
+        io.axi.w.wlast  := (writeBeatCnt === writeBurst - 1.U) || (isLastBlock && unpaddingValidBytes < 16.U)
+
+        when(isLastBlock && regCtrl(5) && unpaddingValidBytes < 16.U) {
+          val wstrb = MuxLookup(unpaddingValidBytes, Fill(32, 1.U(1.W)))(Seq(
+            1.U  -> Cat(Fill(31, 0.U(1.W)), 1.U(1.W)),
+            2.U  -> Cat(Fill(30, 0.U(1.W)), Fill(2, 1.U(1.W))),
+            3.U  -> Cat(Fill(29, 0.U(1.W)), Fill(3, 1.U(1.W))),
+            4.U  -> Cat(Fill(28, 0.U(1.W)), Fill(4, 1.U(1.W))),
+            5.U  -> Cat(Fill(27, 0.U(1.W)), Fill(5, 1.U(1.W))),
+            6.U  -> Cat(Fill(26, 0.U(1.W)), Fill(6, 1.U(1.W))),
+            7.U  -> Cat(Fill(25, 0.U(1.W)), Fill(7, 1.U(1.W))),
+            8.U  -> Cat(Fill(24, 0.U(1.W)), Fill(8, 1.U(1.W))),
+            9.U  -> Cat(Fill(23, 0.U(1.W)), Fill(9, 1.U(1.W))),
+            10.U -> Cat(Fill(22, 0.U(1.W)), Fill(10, 1.U(1.W))),
+            11.U -> Cat(Fill(21, 0.U(1.W)), Fill(11, 1.U(1.W))),
+            12.U -> Cat(Fill(20, 0.U(1.W)), Fill(12, 1.U(1.W))),
+            13.U -> Cat(Fill(19, 0.U(1.W)), Fill(13, 1.U(1.W))),
+            14.U -> Cat(Fill(18, 0.U(1.W)), Fill(14, 1.U(1.W))),
+            15.U -> Cat(Fill(17, 0.U(1.W)), Fill(15, 1.U(1.W)))
+          ))
+          io.axi.w.wstrb := wstrb
+        }
 
         when(io.axi.w.wready) {
           writeBeatCnt := writeBeatCnt + 1.U
           writeAddr := DmaSM4PipelineUtils.alignTo32Byte(writeAddr + burstBeatBytes.U)
           totalProcessed := totalProcessed + 32.U
 
-          // 结束burst
-          val burstEnd = io.axi.w.wlast || (encryptFifo.io.count === 0.U && globalState === sDone)
+          val burstEnd = io.axi.w.wlast || (cryptoFifo.io.count === 0.U && globalState === sDone)
           when(burstEnd) {
             io.axi.w.wvalid := false.B
-            writeState := Mux(encryptFifo.io.deq.valid && (globalState === sRunning || globalState === sPadding), sWSetup, sWIdle)
+            writeState := Mux(cryptoFifo.io.deq.valid && (globalState === sRunning || globalState === sPadding || globalState === sUnpadding), sWSetup, sWIdle)
             
-            // 所有数据写入完成
-            when(encryptFifo.io.count === 0.U && globalState === sPadding) {
+            when(cryptoFifo.io.count === 0.U && (globalState === sPadding || globalState === sUnpadding)) {
               globalState := sDone
             }
           }
@@ -682,13 +775,13 @@ class DMAControllerWithSM4Pipeline(
           writeAddr := regDstAddr
           totalProcessed := 0.U
           lastBlockValidBytes := 0.U
+          unpaddingValidBytes := 0.U
           globalState := sRunning
         }
       }
     }
 
     is(sRunning) {
-      // 读完成后自动进入padding阶段
       when((io.axi.b.bvalid && io.axi.b.bresp =/= 0.U) || (io.axi.r.rvalid && io.axi.r.rresp =/= 0.U)) {
         regCtrl := regCtrl | (1.U << 2)
         globalState := sError
@@ -696,8 +789,13 @@ class DMAControllerWithSM4Pipeline(
     }
 
     is(sPadding) {
-      // padding完成后等待写完成
-      when(encryptFifo.io.count === 0.U && writeState === sWIdle) {
+      when(cryptoFifo.io.count === 0.U && writeState === sWIdle) {
+        globalState := sDone
+      }
+    }
+
+    is(sUnpadding) {
+      when(cryptoFifo.io.count === 0.U && writeState === sWIdle) {
         globalState := sDone
       }
     }
@@ -717,34 +815,30 @@ class DMAControllerWithSM4Pipeline(
     }
   }
 
-  // 状态寄存器
+  // 状态寄存器更新
   regStatus := Cat(
     (globalState === sError),
     (globalState === sDone),
+    (globalState === sUnpadding),
     (globalState === sPadding),
     (globalState === sRunning)
   )
 
-  io.busy := (globalState === sRunning) || (globalState === sPadding)
+  io.busy := (globalState === sRunning) || (globalState === sPadding) || (globalState === sUnpadding)
 }
 
 // ==================== 7. 生成器 ====================
-object DMAGenWithSM4Pipeline extends App {
-  println("Generating Pipelined DMA Controller with SM4 CTR Encryption...")
+object DMAGenWithSM4 extends App {
+  println("Generating Pipelined DMA Controller with SM4 CTR Encryption/Decryption...")
   
   _root_.circt.stage.ChiselStage.emitSystemVerilogFile(
     new DMAControllerWithSM4Pipeline(
       readFifoDepth = 32,
-      encryptFifoDepth = 32,
+      cryptoFifoDepth = 32,
       maxBurstLen = 15
     ),
     Array(
-      "--target-dir=output_dma_sm4_pipeline"
+      "--target-dir=output_dma_sm4_crypto"
     )
   )
-}
-
-// 兼容原有生成器名称
-object DMAGenWithSM4 extends App {
-  DMAGenWithSM4Pipeline.main(args)
 }
