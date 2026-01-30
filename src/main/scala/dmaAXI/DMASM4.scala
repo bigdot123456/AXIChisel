@@ -309,26 +309,27 @@ object DmaSM4PipelineUtils {
 
   // PKCS#7 Padding补位
   def pkcs7Padding(data: UInt, validBytes: UInt): UInt = {
-    val padLen = 16.U - validBytes
-    val padValue = Fill(8, padLen)(7, 0)
-    
+    val padLen = 16.U(5.W) - validBytes
+    val padByte = padLen.asUInt
+    val padValue = Cat(padByte, padByte, padByte, padByte, padByte, padByte, padByte, padByte)
+
     val paddedData = MuxLookup(validBytes, 0.U(128.W))(Seq(
-      1.U  -> Cat(Fill(15, padValue), data(7, 0)),
-      2.U  -> Cat(Fill(14, padValue), data(15, 0)),
-      3.U  -> Cat(Fill(13, padValue), data(23, 0)),
-      4.U  -> Cat(Fill(12, padValue), data(31, 0)),
-      5.U  -> Cat(Fill(11, padValue), data(39, 0)),
-      6.U  -> Cat(Fill(10, padValue), data(47, 0)),
-      7.U  -> Cat(Fill(9, padValue), data(55, 0)),
-      8.U  -> Cat(Fill(8, padValue), data(63, 0)),
-      9.U  -> Cat(Fill(7, padValue), data(71, 0)),
-      10.U -> Cat(Fill(6, padValue), data(79, 0)),
-      11.U -> Cat(Fill(5, padValue), data(87, 0)),
-      12.U -> Cat(Fill(4, padValue), data(95, 0)),
-      13.U -> Cat(Fill(3, padValue), data(103, 0)),
-      14.U -> Cat(Fill(2, padValue), data(111, 0)),
-      15.U -> Cat(Fill(1, padValue), data(119, 0)),
-      16.U -> data
+      1.U(5.W)  -> Cat(Fill(15, padValue), data(7, 0)),
+      2.U(5.W)  -> Cat(Fill(14, padValue), data(15, 0)),
+      3.U(5.W)  -> Cat(Fill(13, padValue), data(23, 0)),
+      4.U(5.W)  -> Cat(Fill(12, padValue), data(31, 0)),
+      5.U(5.W)  -> Cat(Fill(11, padValue), data(39, 0)),
+      6.U(5.W)  -> Cat(Fill(10, padValue), data(47, 0)),
+      7.U(5.W)  -> Cat(Fill(9, padValue), data(55, 0)),
+      8.U(5.W)  -> Cat(Fill(8, padValue), data(63, 0)),
+      9.U(5.W)  -> Cat(Fill(7, padValue), data(71, 0)),
+      10.U(5.W) -> Cat(Fill(6, padValue), data(79, 0)),
+      11.U(5.W) -> Cat(Fill(5, padValue), data(87, 0)),
+      12.U(5.W) -> Cat(Fill(4, padValue), data(95, 0)),
+      13.U(5.W) -> Cat(Fill(3, padValue), data(103, 0)),
+      14.U(5.W) -> Cat(Fill(2, padValue), data(111, 0)),
+      15.U(5.W) -> Cat(Fill(1, padValue), data(119, 0)),
+      16.U(5.W) -> data
     ))
     paddedData
   }
@@ -336,26 +337,26 @@ object DmaSM4PipelineUtils {
   // PKCS#7 Padding去补位
   def pkcs7Unpadding(data: UInt): (UInt, UInt) = {
     val padLen = data(7, 0)
-    val padValid = padLen >= 1.U && padLen <= 16.U
+    val padValid = padLen >= 1.U && padLen <= 16.U(5.W)
     val validData = MuxLookup(padLen, data)(Seq(
-      1.U  -> Cat(0.U(120.W), data(127, 120)),
-      2.U  -> Cat(0.U(112.W), data(127, 112)),
-      3.U  -> Cat(0.U(104.W), data(127, 104)),
-      4.U  -> Cat(0.U(96.W), data(127, 96)),
-      5.U  -> Cat(0.U(88.W), data(127, 88)),
-      6.U  -> Cat(0.U(80.W), data(127, 80)),
-      7.U  -> Cat(0.U(72.W), data(127, 72)),
-      8.U  -> Cat(0.U(64.W), data(127, 64)),
-      9.U  -> Cat(0.U(56.W), data(127, 56)),
-      10.U -> Cat(0.U(48.W), data(127, 48)),
-      11.U -> Cat(0.U(40.W), data(127, 40)),
-      12.U -> Cat(0.U(32.W), data(127, 32)),
-      13.U -> Cat(0.U(24.W), data(127, 24)),
-      14.U -> Cat(0.U(16.W), data(127, 16)),
-      15.U -> Cat(0.U(8.W), data(127, 8)),
-      16.U -> 0.U(128.W)
+      1.U(5.W)  -> Cat(0.U(120.W), data(127, 120)),
+      2.U(5.W)  -> Cat(0.U(112.W), data(127, 112)),
+      3.U(5.W)  -> Cat(0.U(104.W), data(127, 104)),
+      4.U(5.W)  -> Cat(0.U(96.W), data(127, 96)),
+      5.U(5.W)  -> Cat(0.U(88.W), data(127, 88)),
+      6.U(5.W)  -> Cat(0.U(80.W), data(127, 80)),
+      7.U(5.W)  -> Cat(0.U(72.W), data(127, 72)),
+      8.U(5.W)  -> Cat(0.U(64.W), data(127, 64)),
+      9.U(5.W)  -> Cat(0.U(56.W), data(127, 56)),
+      10.U(5.W) -> Cat(0.U(48.W), data(127, 48)),
+      11.U(5.W) -> Cat(0.U(40.W), data(127, 40)),
+      12.U(5.W) -> Cat(0.U(32.W), data(127, 32)),
+      13.U(5.W) -> Cat(0.U(24.W), data(127, 24)),
+      14.U(5.W) -> Cat(0.U(16.W), data(127, 16)),
+      15.U(5.W) -> Cat(0.U(8.W), data(127, 8)),
+      16.U(5.W) -> 0.U(128.W)
     ))
-    val validBytes = 16.U - Mux(padValid, padLen, 0.U)
+    val validBytes = 16.U(5.W) - Mux(padValid, padLen, 0.U)
     (validData, validBytes)
   }
 }
@@ -454,8 +455,8 @@ class DMAControllerWithSM4Pipeline(
   // 传输状态
   val remainBytes = RegInit(0.U(32.W))
   val totalProcessed = RegInit(0.U(32.W))
-  val lastBlockValidBytes = RegInit(0.U(4.W))
-  val unpaddingValidBytes = RegInit(0.U(4.W))
+  val lastBlockValidBytes = RegInit(0.U(5.W))
+  val unpaddingValidBytes = RegInit(0.U(5.W))
 
   // -------------------- 2. APB接口 --------------------
   val apbSel = Wire(UInt(4.W))
@@ -565,39 +566,39 @@ class DMAControllerWithSM4Pipeline(
         val data2_128b = data_32b(255, 128)
         
         val bytesToRead = Mux(remainBytes >= 32.U, 32.U, remainBytes)
-        when(bytesToRead >= 16.U) {
+        when(bytesToRead >= 16.U(5.W)) {
           readFifo.io.enq.valid := true.B
           readFifo.io.enq.bits := data1_128b
-          remainBytes := remainBytes - 16.U
+          remainBytes := remainBytes - 16.U(5.W)
           
-          when(bytesToRead > 16.U) {
+          when(bytesToRead > 16.U(5.W)) {
             val readFifoEn2 = Wire(Bool())
-            readFifoEn2 := readFifo.io.enq.fire && (bytesToRead > 16.U)
+            readFifoEn2 := readFifo.io.enq.fire && (bytesToRead > 16.U(5.W))
             when(readFifoEn2) {
               readFifo.io.enq.bits := data2_128b
-              remainBytes := remainBytes - 16.U
+              remainBytes := remainBytes - 16.U(5.W)
             }
           }.otherwise {
-            lastBlockValidBytes := 16.U
+            lastBlockValidBytes := 16.U(5.W)
           }
         }.otherwise {
-          lastBlockValidBytes := bytesToRead(3, 0)
+          lastBlockValidBytes := bytesToRead(4, 0)
           val partialData = MuxLookup(bytesToRead, 0.U(128.W))(Seq(
-            1.U  -> Cat(0.U(120.W), data_32b(7, 0)),
-            2.U  -> Cat(0.U(112.W), data_32b(15, 0)),
-            3.U  -> Cat(0.U(104.W), data_32b(23, 0)),
-            4.U  -> Cat(0.U(96.W), data_32b(31, 0)),
-            5.U  -> Cat(0.U(88.W), data_32b(39, 0)),
-            6.U  -> Cat(0.U(80.W), data_32b(47, 0)),
-            7.U  -> Cat(0.U(72.W), data_32b(55, 0)),
-            8.U  -> Cat(0.U(64.W), data_32b(63, 0)),
-            9.U  -> Cat(0.U(56.W), data_32b(71, 0)),
-            10.U -> Cat(0.U(48.W), data_32b(79, 0)),
-            11.U -> Cat(0.U(40.W), data_32b(87, 0)),
-            12.U -> Cat(0.U(32.W), data_32b(95, 0)),
-            13.U -> Cat(0.U(24.W), data_32b(103, 0)),
-            14.U -> Cat(0.U(16.W), data_32b(111, 0)),
-            15.U -> Cat(0.U(8.W), data_32b(119, 0))
+            1.U(5.W)  -> Cat(0.U(120.W), data_32b(7, 0)),
+            2.U(5.W)  -> Cat(0.U(112.W), data_32b(15, 0)),
+            3.U(5.W)  -> Cat(0.U(104.W), data_32b(23, 0)),
+            4.U(5.W)  -> Cat(0.U(96.W), data_32b(31, 0)),
+            5.U(5.W)  -> Cat(0.U(88.W), data_32b(39, 0)),
+            6.U(5.W)  -> Cat(0.U(80.W), data_32b(47, 0)),
+            7.U(5.W)  -> Cat(0.U(72.W), data_32b(55, 0)),
+            8.U(5.W)  -> Cat(0.U(64.W), data_32b(63, 0)),
+            9.U(5.W)  -> Cat(0.U(56.W), data_32b(71, 0)),
+            10.U(5.W) -> Cat(0.U(48.W), data_32b(79, 0)),
+            11.U(5.W) -> Cat(0.U(40.W), data_32b(87, 0)),
+            12.U(5.W) -> Cat(0.U(32.W), data_32b(95, 0)),
+            13.U(5.W) -> Cat(0.U(24.W), data_32b(103, 0)),
+            14.U(5.W) -> Cat(0.U(16.W), data_32b(111, 0)),
+            15.U(5.W) -> Cat(0.U(8.W), data_32b(119, 0))
           ))
           readFifo.io.enq.valid := true.B
           readFifo.io.enq.bits := partialData
@@ -721,25 +722,25 @@ class DMAControllerWithSM4Pipeline(
         
         io.axi.w.wdata  := writeDataReg
         io.axi.w.wvalid := true.B
-        io.axi.w.wlast  := (writeBeatCnt === writeBurst - 1.U) || (isLastBlock && unpaddingValidBytes < 16.U)
+        io.axi.w.wlast  := (writeBeatCnt === writeBurst - 1.U) || (isLastBlock && unpaddingValidBytes < 16.U(5.W))
 
-        when(isLastBlock && regCtrl(5) && unpaddingValidBytes < 16.U) {
+        when(isLastBlock && regCtrl(5) && unpaddingValidBytes < 16.U(5.W)) {
           val wstrb = MuxLookup(unpaddingValidBytes, Fill(32, 1.U(1.W)))(Seq(
-            1.U  -> Cat(Fill(31, 0.U(1.W)), 1.U(1.W)),
-            2.U  -> Cat(Fill(30, 0.U(1.W)), Fill(2, 1.U(1.W))),
-            3.U  -> Cat(Fill(29, 0.U(1.W)), Fill(3, 1.U(1.W))),
-            4.U  -> Cat(Fill(28, 0.U(1.W)), Fill(4, 1.U(1.W))),
-            5.U  -> Cat(Fill(27, 0.U(1.W)), Fill(5, 1.U(1.W))),
-            6.U  -> Cat(Fill(26, 0.U(1.W)), Fill(6, 1.U(1.W))),
-            7.U  -> Cat(Fill(25, 0.U(1.W)), Fill(7, 1.U(1.W))),
-            8.U  -> Cat(Fill(24, 0.U(1.W)), Fill(8, 1.U(1.W))),
-            9.U  -> Cat(Fill(23, 0.U(1.W)), Fill(9, 1.U(1.W))),
-            10.U -> Cat(Fill(22, 0.U(1.W)), Fill(10, 1.U(1.W))),
-            11.U -> Cat(Fill(21, 0.U(1.W)), Fill(11, 1.U(1.W))),
-            12.U -> Cat(Fill(20, 0.U(1.W)), Fill(12, 1.U(1.W))),
-            13.U -> Cat(Fill(19, 0.U(1.W)), Fill(13, 1.U(1.W))),
-            14.U -> Cat(Fill(18, 0.U(1.W)), Fill(14, 1.U(1.W))),
-            15.U -> Cat(Fill(17, 0.U(1.W)), Fill(15, 1.U(1.W)))
+            1.U(5.W)  -> Cat(Fill(31, 0.U(1.W)), 1.U(1.W)),
+            2.U(5.W)  -> Cat(Fill(30, 0.U(1.W)), Fill(2, 1.U(1.W))),
+            3.U(5.W)  -> Cat(Fill(29, 0.U(1.W)), Fill(3, 1.U(1.W))),
+            4.U(5.W)  -> Cat(Fill(28, 0.U(1.W)), Fill(4, 1.U(1.W))),
+            5.U(5.W)  -> Cat(Fill(27, 0.U(1.W)), Fill(5, 1.U(1.W))),
+            6.U(5.W)  -> Cat(Fill(26, 0.U(1.W)), Fill(6, 1.U(1.W))),
+            7.U(5.W)  -> Cat(Fill(25, 0.U(1.W)), Fill(7, 1.U(1.W))),
+            8.U(5.W)  -> Cat(Fill(24, 0.U(1.W)), Fill(8, 1.U(1.W))),
+            9.U(5.W)  -> Cat(Fill(23, 0.U(1.W)), Fill(9, 1.U(1.W))),
+            10.U(5.W) -> Cat(Fill(22, 0.U(1.W)), Fill(10, 1.U(1.W))),
+            11.U(5.W) -> Cat(Fill(21, 0.U(1.W)), Fill(11, 1.U(1.W))),
+            12.U(5.W) -> Cat(Fill(20, 0.U(1.W)), Fill(12, 1.U(1.W))),
+            13.U(5.W) -> Cat(Fill(19, 0.U(1.W)), Fill(13, 1.U(1.W))),
+            14.U(5.W) -> Cat(Fill(18, 0.U(1.W)), Fill(14, 1.U(1.W))),
+            15.U(5.W) -> Cat(Fill(17, 0.U(1.W)), Fill(15, 1.U(1.W)))
           ))
           io.axi.w.wstrb := wstrb
         }
